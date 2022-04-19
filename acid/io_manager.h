@@ -6,8 +6,8 @@
 #define ACID_IO_MANAGER_H
 #include <atomic>
 #include <memory>
-#include "mutex.h"
 #include "scheduler.h"
+#include "sync.h"
 #include "timer.h"
 namespace acid{
 class IOManager: public Scheduler, public TimeManager{
@@ -71,6 +71,7 @@ private:
 
     bool stopping(uint64_t &timeout);
 };
-
+#define go (*acid::IOManager::GetThis()) +
+#define Go  (*acid::IOManager::GetThis()) + [=]()mutable
 }
 #endif //ACID_IO_MANAGER_H

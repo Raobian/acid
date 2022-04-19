@@ -17,11 +17,8 @@ cd yaml-cpp
 mkdir build
 cd build
 cmake ..
-make #make时如果编译test错误可以忽略
-sudo cp libyaml-cpp.a /usr/local/lib
-cd ..
-sudo cp -r include/yaml-cpp /usr/local/include
-cd ..
+sudo make install
+cd ../..
 ```
 
 3.构建项目 / Build
@@ -41,13 +38,15 @@ make完可在acid/bin执行example和test的例子。
 本项目将从零开始搭建出一个基于协程的异步RPC框架。
 
 通过本项目你将学习到：
-- 序列化协议
-- 通信协议
-- 服务注册
-- 服务发现
-- 负载均衡
-- 心跳机制
-- 三种异步调用方式
+- [协程同步原语](#协程同步原语)
+- [序列化协议](#序列化协议)
+- [通信协议](#通信协议)
+- [连接复用](#连接复用)
+- [服务注册](#服务注册)
+- [服务发现](#服务发现)
+- [负载均衡](#负载均衡)
+- [健康检查](#健康检查)
+- [三种异步调用方式](#三种异步调用方式)
 
 
 相信大家对RPC的相关概念都已经很熟悉了，这里不做过多介绍，直接进入重点。
@@ -76,14 +75,30 @@ make完可在acid/bin执行example和test的例子。
 然后选择一种负载均衡策略从本地缓存中筛选出一个目标地址发起调用，
 并将这个连接存入连接池等待下一次调用。
 
+### 协程同步原语
+
+我们都知道，一旦协程阻塞后整个协程所在的线程都将阻塞，这也就失去了协程的优势。编写协程程序时难免会对一些数据进行同步，而Linux下常见的同步原语互斥量、条件变量、信号量等基本都会堵塞整个线程，使用原生同步原语协程性能将大幅下降，甚至发生死锁的概率大大增加。
+
+框架实现了一套协程同步原语来解决原生同步原语带来的阻塞问题，在协程同步原语之上实现更高层次同步的抽象——Channel用于协程之间的便捷通信。
+
+具体设计思路见 [通用协程同步原语设计](docs/通用协程同步原语设计.md)
+
 ### 序列化协议
+本模块支持了基本类型以及标准库容器的序列化，包括：
+* 顺序容器：string, list, vector
+* 关联容器：set, multiset, map, multimap
+* 无序容器：unordered_set, unordered_multiset, unordered_map, unordered_multimap
+* 异构容器：tuple
+
+以及通过以上任意组合嵌套类型的序列化
+
 序列化有以下规则：
 1. 默认情况下序列化，8，16位类型以及浮点数不压缩，32，64位有符号/无符号数采用 zigzag 和 varints 编码压缩
 2. 针对 std::string 会将长度信息压缩序列化作为元数据，然后将原数据直接写入。char数组会先转换成 std::string 后按此规则序列化
 3. 调用 writeFint 将不会压缩数字，调用 writeRowData 不会加入长度信息
 
-对于任意类型，只要实现了以下的重载，即可参与传输时的序列化。
-```c++
+对于任意用户自定义类型，只要实现了以下的重载，即可参与传输时的序列化。
+```cpp
 template<typename T>
 Serializer &operator >> (Serializer& in, T& i){
    return *this;
@@ -94,13 +109,21 @@ Serializer &operator << (Serializer& in, T i){
 }
 ```
 
-本模块同时提供了将tuple序列化和反序列化回tuple的功能。
 
-调用方发起过程调用时，先将参数打包成tuple，再进行序列化传输。
-被调用方收到调用请求时，先将参数包反序列回tuple，再解包转发给函数。
+rpc调用过程：
 
-    
+- 调用方发起过程调用时，自动将参数打包成tuple，然后序列化传输。
+- 被调用方收到调用请求时，先将参数包反序列回tuple，再解包转发给函数。
+
+
 ### 通信协议
+```c
++--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+
+|  BYTE  |        |        |        |        |        |        |        |        |        |        |             ........                                                           |
++--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+
+|  magic | version|  type  |          sequence id              |          content length           |             content byte[]                                                     |
++--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+
+```
 
 封装通信协议，使RPC Server和RPC Client 可以基于同一协议通信。
 
@@ -110,14 +133,14 @@ Serializer &operator << (Serializer& in, T i){
 
 第二个字节代表协议版本号，以便对协议进行扩展，使用不同的协议解析器。
 
-第三个字节是请求类型，如心跳包，请求，响应等。
+第四个字节开始是一个32位序列号，用来识别请求顺序。
 
-第四个字节表示消息长度，占四个字节，表示后面还有多少个字节的数据。
+第七个字节开始的四字节表示消息长度，即后面要接收的内容长度。
 
 除了协议头固定7字节，消息不定长。
 
 目前提供了以下几种请求
-```c++
+```cpp
 enum class MsgType : uint8_t {
     HEARTBEAT_PACKET,       // 心跳包
     RPC_PROVIDER,           // 向服务中心声明为provider
@@ -136,18 +159,26 @@ enum class MsgType : uint8_t {
     RPC_SERVICE_DISCOVER_RESPONSE
 };
 ```
+### 连接复用
+对于短连接来说，每次发起rpc调用就创建一条连接，由于没有竞争实现起来比较容易，但开销太大。所以本框架实现了rpc连接复用来支持更高的并发。
+
+连接复用的问题在于，在一条连接上可以有多个并发的调用请求，由于服务器也是并发处理这些请求的，所以导致了服务器返回的响应顺序与请求顺序不一致。
+
+具体的解决方法见 [rpc连接复用设计](docs/rpc连接复用设计.md)
+
 ### 服务注册
 每一个服务提供者对应的机器或者实例在启动运行的时候，
 都去向注册中心注册自己提供的服务以及开放的端口。
 注册中心维护一个服务名到服务地址的多重映射，一个服务下有多个服务地址，
 同时需要维护连接状态，断开连接后移除服务。
-```c++
+```cpp
 /**
  * 维护服务名和服务地址列表的多重映射
  * serviceName -> serviceAddress1
  *             -> serviceAddress2
  *             ...
  */
+std::multimap<std::string, std::string> m_services;
 ```
 ### 服务发现
 虽然服务调用是服务消费方直接发向服务提供方的，但是分布式的服务，都是集群部署的，
@@ -158,16 +189,14 @@ enum class MsgType : uint8_t {
 客户端从注册中心获取服务，它需要在发起调用时，
 从注册中心拉取开放服务的服务器地址列表存入本地缓存，
 
-RPC连接池采用LRU淘汰算法，关闭最旧未使用的连接。
-
 ### 负载均衡
 实现通用类型负载均衡路由引擎（工厂）。
 通过路由引擎获取指定枚举类型的负载均衡器，
 降低了代码耦合，规范了各个负载均衡器的使用，减少出错的可能。
 
-提供了三种路由策略（随机、轮询、哈希）, 
+提供了三种路由策略（随机、轮询、一致性哈希）, 
 由客户端使用，在客户端实现负载均衡
-```c++
+```cpp
 
 /**
  * @brief: 路由均衡引擎
@@ -193,15 +222,14 @@ private:
 };
 ```
 选择客户端负载均衡策略，根据路由策略选择服务地址。默认随机策略。
-```c++
-acid::rpc::RouteStrategy<std::string>::ptr strategy =
-        acid::rpc::RouteEngine<std::string>::queryStrategy(
-                acid::rpc::RouteStrategy<std::string>::Random);
+```cpp
+RouteStrategy<int>::ptr strategy =
+            RouteEngine<int>::queryStrategy(Strategy::Random);
 ```
 客户端同时会维护RPC连接池，以及服务发现结果缓存，减少频繁建立连接。
 
 通过上述策略尽量消除或减少系统压力及系统中各节点负载不均衡的现象。
-### 心跳机制
+### 健康检查
 服务中心必须管理服务器的存活状态，也就是健康检查。
 注册服务的这一组机器，当这个服务组的某台机器如果出现宕机或者服务死掉的时候，
 就会剔除掉这台机器。这样就实现了自动监控和管理。
@@ -221,28 +249,28 @@ acid::rpc::RouteStrategy<std::string>::ptr strategy =
 1. 以同步的方式异步调用
 
 整个框架本身基于协程池，所以在遇到阻塞时会自动调度实现以同步的方式异步调用
-```c++
-auto sync_call = con->call<int>("add", 123, 321);
-ACID_LOG_INFO(g_logger) << sync_call.getVal();
+```cpp
+Result<int> res = con->call<int>("add", 123, 321);
+ACID_LOG_INFO(g_logger) << res.getVal();
 ```
 2. future 形式的异步调用
 
 调用时会立即返回一个future
-```c++
-auto async_call_future = con->async_call<int>("add", 123, 321);
-ACID_LOG_INFO(g_logger) << async_call_future.get().getVal();
+```cpp
+future<Result<int>> res = con->async_call<int>("add", 123, 321);
+ACID_LOG_INFO(g_logger) << res.get().getVal();
 ```
 3. 异步回调
 
 async_call的第一个参数为函数时，启用回调模式，回调参数必须是返回类型的包装。收到消息时执行回调。
-```c++
-con->async_call<int>([](acid::rpc::Result<int> res){
+```cpp
+con->async_call<int>([](Result<int> res){
     ACID_LOG_INFO(g_logger) << res.getVal();
 }, "add", 123, 321); 
 ```
 
 对调用结果及状态的封装如下
-```c++
+```cpp
 /**
  * @brief RPC调用状态
  */
@@ -278,7 +306,7 @@ private:
 ## 示例
 
 rpc服务注册中心
-```c++
+```cpp
 #include "acid/rpc/rpc_service_registry.h"
 
 // 服务注册中心
@@ -293,20 +321,15 @@ void Main() {
 }
 
 int main() {
-    acid::IOManager::ptr loop = std::make_shared<acid::IOManager>();
-    loop->submit(Main);
+    go Main;
 }
 ```
 rpc 服务提供者
-```c++
+```cpp
 #include "acid/rpc/rpc_server.h"
 
 int add(int a,int b){
     return a + b;
-}
-
-std::string getStr() {
-    return  "hello world";
 }
 
 // 向服务中心注册服务，并处理客户端请求
@@ -315,13 +338,18 @@ void Main() {
     acid::Address::ptr local = acid::IPv4Address::Create("127.0.0.1",port);
     acid::Address::ptr registry = acid::Address::LookupAny("127.0.0.1:8080");
 
-    acid::rpc::RpcServer::ptr server = std::make_shared<acid::rpc::RpcServer>();
+    acid::rpc::RpcServer::ptr server = std::make_shared<acid::rpc::RpcServer>();;
 
-    // 注册服务，支持函数指针和函数对象
+    // 注册服务，支持函数指针
     server->registerMethod("add",add);
-    server->registerMethod("getStr",getStr);
+    // 支持函数对象
     server->registerMethod("echo", [](std::string str){
         return str;
+    });
+    // 支持标准库容器
+    server->registerMethod("revers", [](std::vector<std::string> vec) -> std::vector<std::string>{
+        std::reverse(vec.begin(), vec.end());
+        return vec;
     });
 
     // 先绑定本地地址
@@ -335,13 +363,12 @@ void Main() {
 }
 
 int main() {
-    acid::IOManager::ptr loop = std::make_shared<acid::IOManager>();
-    loop->submit(Main);
+    go Main;
 }
 ```
 rpc 服务消费者，并不直接用RpcClient，而是采用更高级的封装，RpcConnectionPool。
 提供了连接池和服务地址缓存。
-```c++
+```cpp
 #include "acid/log.h"
 #include "acid/rpc/rpc_connection_pool.h"
 
@@ -352,7 +379,7 @@ void Main() {
     acid::Address::ptr registry = acid::Address::LookupAny("127.0.0.1:8080");
 
     // 设置连接池的数量
-    acid::rpc::RpcConnectionPool::ptr con = std::make_shared<acid::rpc::RpcConnectionPool>(5);
+    acid::rpc::RpcConnectionPool::ptr con = std::make_shared<acid::rpc::RpcConnectionPool>();
 
     // 连接服务中心
     con->connect(registry);
@@ -369,12 +396,19 @@ void Main() {
     con->async_call<int>([](acid::rpc::Result<int> res){
         ACID_LOG_INFO(g_logger) << res.getVal();
     }, "add", 123, 321);
-
+    
+    // 测试并发
+    int n=0;
+    while(n != 1000) {
+        n++;
+        con->async_call<int>([](acid::rpc::Result<int> res){
+            ACID_LOG_INFO(g_logger) << res.getVal();
+        }, "add", 0, n);
+    }
 }
 
 int main() {
-    acid::IOManager::ptr loop = std::make_shared<acid::IOManager>();
-    loop->submit(Main);
+    go Main;
 }
 ```
 

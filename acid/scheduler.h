@@ -11,7 +11,7 @@
 #include <queue>
 #include <vector>
 #include "fiber.h"
-#include "mutex.h"
+#include "sync.h"
 #include "macro.h"
 #include "thread.h"
 namespace acid{
@@ -47,7 +47,8 @@ public:
      * @param[in] thread 协程执行的线程id,-1标识任意线程
      */
     template<class FiberOrCb>
-    void submit(FiberOrCb&& fc, int thread = -1) {
+    [[maybe_unused]]
+    Scheduler* submit(FiberOrCb&& fc, int thread = -1) {
         bool need_notify = false;
         {
             MutexType::Lock lock(m_mutex);
@@ -57,6 +58,7 @@ public:
         if(need_notify) {
             notify();
         }
+        return this;
     }
     /**
      * @brief 批量调度协程
@@ -78,9 +80,14 @@ public:
         }
     }
 
+    template<class FiberOrCb>
+    [[maybe_unused]]
+    Scheduler* operator+(FiberOrCb&& fc) {
+        return submit(std::move(fc));
+    }
+
     static Scheduler* GetThis();
-    //static void SetThis(Scheduler* sc);
-    //static Fiber* GetMainFiber();
+
 protected:
     /**
      * @brief 通知协程调度器有任务了

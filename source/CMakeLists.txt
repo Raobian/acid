@@ -6,6 +6,7 @@ set(LIB_SRC
         config.cpp
         fd_manager.cpp
         fiber.cpp
+        file_monitor.cpp
 
         http/http.cpp
         http/http_connection.cpp
@@ -19,7 +20,6 @@ set(LIB_SRC
         io_manager.cpp
         lexical_cast.cpp
         log.cpp
-        mutex.cpp
 
         net/address.cpp
         net/socket.cpp
@@ -27,9 +27,14 @@ set(LIB_SRC
         net/tcp_server.cpp
         net/uri.cpp
 
+        rpc/rpc_client.cpp
         rpc/rpc_server.cpp
         rpc/rpc_service_register.cpp
         rpc/rpc_connection_pool.cpp
+        rpc/rpc_session.cpp
+
+        sync/mutex.cpp
+        sync/co_condvar.cpp
 
         scheduler.cpp
         stream.cpp
